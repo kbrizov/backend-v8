@@ -94,6 +94,9 @@ if "%NEW_WRAP%"=="with_new_wrap" (
 )
 call ninja -v -C out.gn\x64.release v8
 
+echo =====[ Build d8 (same GN args as the library, for V8 bug repro) ]=====
+call ninja -v -C out.gn\x64.release d8
+
 md output\v8\Lib\Win64DLL
 copy /Y out.gn\x64.release\v8.dll.lib output\v8\Lib\Win64DLL\
 copy /Y out.gn\x64.release\v8_libplatform.dll.lib output\v8\Lib\Win64DLL\
@@ -131,3 +134,6 @@ if "%VERSION%"=="11.8.172" (
   copy /Y out.gn\x64.release\zlib.dll output\v8\Lib\Win64DLL\
   copy /Y out.gn\x64.release\zlib.dll.pdb output\v8\Lib\Win64DLL\
 )
+
+@REM d8 产物（is_component_build 下 d8.exe 依赖同目录的 v8.dll 等，已一并拷贝）
+copy /Y out.gn\x64.release\d8.exe output\v8\Lib\Win64DLL\
