@@ -1,0 +1,41 @@
+diff --git a/src/d8/d8.cc b/src/d8/d8.cc
+index 38810ca..e99951c 100644
+--- a/src/d8/d8.cc
++++ b/src/d8/d8.cc
+@@ -3622,6 +3622,12 @@ void Shell::Version(const v8::FunctionCallbackInfo<v8::Value>& info) {
+           .ToLocalChecked());
+ }
+ 
++void Shell::LowMemoryNotification(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  DCHECK(i::ValidateCallbackInfo(info));
++  info.GetIsolate()->LowMemoryNotification();
++}
++
+ void Shell::ReportException(Isolate* isolate, Local<v8::Message> message,
+                             Local<v8::Value> exception_obj) {
+   HandleScope handle_scope(isolate);
+@@ -3872,6 +3878,10 @@ Local<ObjectTemplate> Shell::CreateGlobalTemplate(Isolate* isolate) {
+   global_template->Set(isolate, "version",
+                        FunctionTemplate::New(isolate, Version));
+ 
++  global_template->Set(
++      isolate, "lowMemoryNotification",
++      FunctionTemplate::New(isolate, LowMemoryNotification));
++
+   global_template->Set(isolate, "print", FunctionTemplate::New(isolate, Print));
+   global_template->Set(isolate, "printErr",
+                        FunctionTemplate::New(isolate, PrintErr));
+diff --git a/src/d8/d8.h b/src/d8/d8.h
+index 6fb1394..d48b6e6 100644
+--- a/src/d8/d8.h
++++ b/src/d8/d8.h
+@@ -648,6 +648,8 @@ class Shell : public i::AllStatic {
+   static void Quit(const v8::FunctionCallbackInfo<v8::Value>& info);
+   static void Terminate(const v8::FunctionCallbackInfo<v8::Value>& info);
+   static void Version(const v8::FunctionCallbackInfo<v8::Value>& info);
++  static void LowMemoryNotification(
++      const v8::FunctionCallbackInfo<v8::Value>& info);
+   static void WriteFile(const v8::FunctionCallbackInfo<v8::Value>& info);
+   static void ReadFile(const v8::FunctionCallbackInfo<v8::Value>& info);
+   static void CreateWasmMemoryMapDescriptor(
