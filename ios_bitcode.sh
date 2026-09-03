@@ -44,6 +44,10 @@ if [ "$VERSION" == "12.9.202.27" -o "$VERSION" == "13.6.233.17" ]; then
   node $GITHUB_WORKSPACE/node-script/do-gitpatch.js -p $GITHUB_WORKSPACE/patches/enable_wee8_v$VERSION.patch
 fi
 
+if [ "$VERSION" == "13.6.233.17" ]; then 
+  node $GITHUB_WORKSPACE/node-script/do-gitpatch.js -p $GITHUB_WORKSPACE/patches/ephemeron_remembered_set_fix_v13.6.233.17.patch
+fi
+
 echo "=====[ add ArrayBuffer_New_Without_Stl ]====="
 node $GITHUB_WORKSPACE/node-script/add_arraybuffer_new_without_stl.js . $VERSION $NEW_WRAP
 

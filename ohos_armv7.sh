@@ -85,6 +85,7 @@ if [ "$VERSION" == "13.6.233.17" ]; then
   cd build
   node $GITHUB_WORKSPACE/node-script/do-gitpatch.js -p $GITHUB_WORKSPACE/patches/turn_off_crel_v13.6.233.17.patch
   cd ..
+  node $GITHUB_WORKSPACE/node-script/do-gitpatch.js -p $GITHUB_WORKSPACE/patches/ephemeron_remembered_set_fix_v13.6.233.17.patch
 fi
 
 if [ "$VERSION" == "9.4.146.24" ]; then

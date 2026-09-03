@@ -1,0 +1,707 @@
+diff --git a/src/common/globals.h b/src/common/globals.h
+index 7a90d5d2f20..09ff893449f 100644
+--- a/src/common/globals.h
++++ b/src/common/globals.h
+@@ -1545,7 +1545,12 @@ inline constexpr bool IsSharedAllocationType(AllocationType kind) {
+          kind == AllocationType::kSharedMap;
+ }
+ 
+-enum AllocationAlignment {
++enum class RecordYoungSlot : bool {
++  kNo,
++  kYes,
++};
++
++enum AllocationAlignment : uint8_t {
+   // The allocated address is kTaggedSize aligned (this is default for most of
+   // the allocations).
+   kTaggedAligned,
+diff --git a/src/heap/concurrent-marking.cc b/src/heap/concurrent-marking.cc
+index 0a50da1202c..6b4678a5d94 100644
+--- a/src/heap/concurrent-marking.cc
++++ b/src/heap/concurrent-marking.cc
+@@ -180,10 +180,10 @@ class ConcurrentMarkingVisitor final
+     return false;
+   }
+ 
+-  template <typename TSlot>
++  template <typename TSlot, RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
+   void RecordSlot(Tagged<HeapObject> object, TSlot slot,
+                   Tagged<HeapObject> target) {
+-    MarkCompactCollector::RecordSlot(object, slot, target);
++    MarkCompactCollector::RecordSlot<TSlot, kRecordYoung>(object, slot, target);
+   }
+ 
+   void IncrementLiveBytesCached(MutablePageMetadata* chunk, intptr_t by) {
+diff --git a/src/heap/ephemeron-remembered-set.h b/src/heap/ephemeron-remembered-set.h
+index 277337a225c..d93ddf0df3d 100644
+--- a/src/heap/ephemeron-remembered-set.h
++++ b/src/heap/ephemeron-remembered-set.h
+@@ -19,6 +19,12 @@ namespace v8::internal {
+ // usual OLD_TO_NEW remembered set. The remembered set is used to avoid
+ // strongifying keys in such hash tables in young generation garbage
+ // collections.
++// This remembered set is exclusively used for Minor GCs. Once we start
++// incremental marking for a Full GC this remembered set is cleared. The markers
++// and write barriers for the Full GC will record these slots in the regular
++// OLD_TO_NEW remembered set then. In addition after a Full GC new space is
++// empty because all live objects were promoted, so we have the guaranteee that
++// there are no old-to-new refs anymore.
+ class EphemeronRememberedSet final {
+  public:
+   static constexpr int kEphemeronTableListSegmentSize = 128;
+diff --git a/src/heap/heap-verifier.cc b/src/heap/heap-verifier.cc
+index c096824b1a0..d91a492e3c0 100644
+--- a/src/heap/heap-verifier.cc
++++ b/src/heap/heap-verifier.cc
+@@ -624,22 +624,24 @@ class OldToNewSlotVerifyingVisitor : public SlotVerifyingVisitor {
+            !HeapLayout::InYoungGeneration(host);
+   }
+ 
+-  void VisitEphemeron(Tagged<HeapObject> host, int index, ObjectSlot key,
++  void VisitEphemeron(Tagged<HeapObject> host, int index, ObjectSlot key_slot,
+                       ObjectSlot target) override {
+     VisitPointer(host, target);
+     if (v8_flags.minor_ms) return;
+-    // Keys are handled separately and should never appear in this set.
+-    CHECK(!InUntypedSet(key));
+-    Tagged<Object> k = *key;
+-    if (!HeapLayout::InYoungGeneration(host) &&
+-        HeapLayout::InYoungGeneration(k)) {
+-      Tagged<EphemeronHashTable> table = i::Cast<EphemeronHashTable>(host);
+-      auto it = ephemeron_remembered_set_->find(table);
+-      CHECK(it != ephemeron_remembered_set_->end());
+-      int slot_index =
+-          EphemeronHashTable::SlotToIndex(table.address(), key.address());
+-      InternalIndex entry = EphemeronHashTable::IndexToEntry(slot_index);
+-      CHECK(it->second.find(entry.as_int()) != it->second.end());
++    Tagged<EphemeronHashTable> table = i::Cast<EphemeronHashTable>(host);
++    if (!heap_->incremental_marking()->IsMajorMarking()) {
++      // Keys are handled separately and should never appear in this set.
++      CHECK(!InUntypedSet(key_slot));
++      Tagged<Object> k = *key_slot;
++      if (!HeapLayout::InYoungGeneration(host) &&
++          HeapLayout::InYoungGeneration(k)) {
++        auto it = ephemeron_remembered_set_->find(table);
++        CHECK(it != ephemeron_remembered_set_->end());
++        int slot_index = EphemeronHashTable::SlotToIndex(table.address(),
++                                                         key_slot.address());
++        InternalIndex entry = EphemeronHashTable::IndexToEntry(slot_index);
++        CHECK(it->second.find(entry.as_int()) != it->second.end());
++      }
+     }
+   }
+ 
+diff --git a/src/heap/heap-write-barrier-inl.h b/src/heap/heap-write-barrier-inl.h
+index 00b5a7dc72f..e4318ede0f2 100644
+--- a/src/heap/heap-write-barrier-inl.h
++++ b/src/heap/heap-write-barrier-inl.h
+@@ -149,21 +149,24 @@ void WriteBarrier::ForEphemeronHashTable(Tagged<EphemeronHashTable> host,
+ 
+   Tagged<HeapObject> heap_object_value = Cast<HeapObject>(value);
+   MemoryChunk* value_chunk = MemoryChunk::FromHeapObject(heap_object_value);
++  DCHECK(!value_chunk->Metadata()->is_writable_shared());
+ 
+   const bool pointers_from_here_are_interesting =
+       !host_chunk->IsYoungOrSharedChunk();
+   const bool is_marking = host_chunk->IsMarking();
+ 
+-  if (pointers_from_here_are_interesting &&
+-      value_chunk->IsYoungOrSharedChunk()) {
++  if (is_marking) {
++    // Marking barrier: mark value & record slots when marking is on.
++    MarkingSlow<RecordYoungSlot::kYes>(host, HeapObjectSlot(slot),
++                                       heap_object_value);
++
++    // Only trigger the generation barrier while marking is off. That way we
++    // keep the remembered set empty after incremental marking started.
++  } else if (pointers_from_here_are_interesting &&
++             value_chunk->IsYoungOrSharedChunk()) {
+     CombinedGenerationalAndSharedEphemeronBarrierSlow(host, slot.address(),
+                                                       heap_object_value);
+   }
+-
+-  // Marking barrier: mark value & record slots when marking is on.
+-  if (is_marking) {
+-    MarkingSlow(host, HeapObjectSlot(slot), heap_object_value);
+-  }
+ }
+ 
+ // static
+diff --git a/src/heap/heap-write-barrier.cc b/src/heap/heap-write-barrier.cc
+index 5a547bfed24..9a7c5227909 100644
+--- a/src/heap/heap-write-barrier.cc
++++ b/src/heap/heap-write-barrier.cc
+@@ -46,13 +46,21 @@ MarkingBarrier* WriteBarrier::SetForThread(MarkingBarrier* marking_barrier) {
+   return existing;
+ }
+ 
++template V8_EXPORT_PRIVATE void WriteBarrier::MarkingSlow<RecordYoungSlot::kNo>(
++    Tagged<HeapObject> host, HeapObjectSlot slot, Tagged<HeapObject> value);
++template V8_EXPORT_PRIVATE void
++WriteBarrier::MarkingSlow<RecordYoungSlot::kYes>(Tagged<HeapObject> host,
++                                                 HeapObjectSlot slot,
++                                                 Tagged<HeapObject> value);
++
++template <RecordYoungSlot kRecordYoung>
+ void WriteBarrier::MarkingSlow(Tagged<HeapObject> host, HeapObjectSlot slot,
+                                Tagged<HeapObject> value) {
+   SLOW_DCHECK_IMPLIES(kUninterestingPagesCanBeSkipped,
+                       MemoryChunk::FromHeapObject(host)->GetFlags() &
+                           MemoryChunk::kPointersFromHereAreInterestingMask);
+   MarkingBarrier* marking_barrier = CurrentMarkingBarrier(host);
+-  marking_barrier->Write(host, slot, value);
++  marking_barrier->Write<HeapObjectSlot, kRecordYoung>(host, slot, value);
+ }
+ 
+ // static
+diff --git a/src/heap/heap-write-barrier.h b/src/heap/heap-write-barrier.h
+index 3b73ab2e1b0..1651542037c 100644
+--- a/src/heap/heap-write-barrier.h
++++ b/src/heap/heap-write-barrier.h
+@@ -139,6 +139,7 @@ class V8_EXPORT_PRIVATE WriteBarrier final {
+                              Tagged<TrustedObject> value);
+   static inline void Marking(Tagged<HeapObject> host, JSDispatchHandle handle);
+ 
++  template <RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
+   static void MarkingSlow(Tagged<HeapObject> host, HeapObjectSlot,
+                           Tagged<HeapObject> value);
+   static void MarkingSlow(Tagged<InstructionStream> host, RelocInfo*,
+diff --git a/src/heap/mark-compact-inl.h b/src/heap/mark-compact-inl.h
+index a8f96800364..3e6a85377ec 100644
+--- a/src/heap/mark-compact-inl.h
++++ b/src/heap/mark-compact-inl.h
+@@ -13,7 +13,6 @@
+ #include "src/heap/marking-state-inl.h"
+ #include "src/heap/marking-visitor-inl.h"
+ #include "src/heap/marking-worklist-inl.h"
+-#include "src/heap/marking-worklist.h"
+ #include "src/heap/marking.h"
+ #include "src/heap/remembered-set-inl.h"
+ #include "src/objects/js-collection-inl.h"
+@@ -85,6 +84,64 @@ void MarkCompactCollector::RecordSlot(MemoryChunk* source_chunk,
+   }
+ }
+ 
++// static
++template <typename THeapObjectSlot, RecordYoungSlot kRecordYoung>
++void MarkCompactCollector::RecordSlot(Tagged<HeapObject> host,
++                                      THeapObjectSlot slot,
++                                      Tagged<HeapObject> value) {
++  MemoryChunk* host_chunk = MemoryChunk::FromHeapObject(host);
++  if (host_chunk->ShouldSkipEvacuationSlotRecording()) {
++    return;
++  }
++  RecordSlot<THeapObjectSlot, kRecordYoung>(host_chunk, slot, value);
++}
++
++// static
++template <typename THeapObjectSlot, RecordYoungSlot kRecordYoung>
++void MarkCompactCollector::RecordSlot(MemoryChunk* host_chunk,
++                                      THeapObjectSlot slot,
++                                      Tagged<HeapObject> value) {
++  const MemoryChunk* value_chunk = MemoryChunk::FromHeapObject(value);
++  if (!value_chunk->IsEvacuationCandidate() &&
++      (!static_cast<bool>(kRecordYoung) ||
++       !HeapLayout::InYoungGeneration(value_chunk, value))) {
++    return;
++  }
++
++  const auto* isolate = Isolate::Current();
++  MutablePageMetadata* host_page =
++      MutablePageMetadata::cast(host_chunk->Metadata(isolate));
++  const MutablePageMetadata* value_page =
++      MutablePageMetadata::cast(value_chunk->Metadata(isolate));
++
++  if (static_cast<bool>(kRecordYoung) &&
++      HeapLayout::InYoungGeneration(value_chunk, value)) {
++    RememberedSet<OLD_TO_NEW_BACKGROUND>::Insert<AccessMode::ATOMIC>(
++        host_page, host_chunk->Offset(slot.address()));
++  } else if (value_page->is_executable()) {
++    DCHECK(!InsideSandbox(value_chunk->address()));
++    RememberedSet<TRUSTED_TO_CODE>::Insert<AccessMode::ATOMIC>(
++        host_page, host_chunk->Offset(slot.address()));
++  } else if (host_page->is_trusted() && value_page->is_trusted()) {
++    DCHECK(!InsideSandbox(value_chunk->address()));
++    RememberedSet<TRUSTED_TO_TRUSTED>::Insert<AccessMode::ATOMIC>(
++        host_page, host_chunk->Offset(slot.address()));
++  } else if (V8_LIKELY(!value_page->is_writable_shared()) ||
++             host_page->heap()->isolate()->is_shared_space_isolate()) {
++    DCHECK_EQ(host_page->heap(), value_page->heap());
++    RememberedSet<OLD_TO_OLD>::Insert<AccessMode::ATOMIC>(
++        host_page, host_chunk->Offset(slot.address()));
++  } else {
++    // The only case that we do not record are local->shared references from
++    // client heaps, see the following DCHECKs.
++    DCHECK(!host_page->heap()->isolate()->is_shared_space_isolate());
++    DCHECK(value_page->heap()->isolate()->is_shared_space_isolate());
++    DCHECK(value_page->is_writable_shared());
++    DCHECK_EQ(value_page->is_writable_shared(),
++              value_chunk->InWritableSharedSpace());
++  }
++}
++
+ void MarkCompactCollector::AddTransitionArray(Tagged<TransitionArray> array) {
+   local_weak_objects()->transition_arrays_local.Push(array);
+ }
+diff --git a/src/heap/mark-compact.cc b/src/heap/mark-compact.cc
+index 0da876053ce..55233455153 100644
+--- a/src/heap/mark-compact.cc
++++ b/src/heap/mark-compact.cc
+@@ -179,6 +179,27 @@ class FullMarkingVerifier : public MarkingVerifierBase {
+     }
+   }
+ 
++  void VisitEphemeron(Tagged<HeapObject> host, int index, ObjectSlot key_slot,
++                      ObjectSlot value_slot) override {
++    // First verify that both key and value are marked.
++    VerifyPointers(key_slot, key_slot + 1);
++    VerifyPointers(value_slot, value_slot + 1);
++
++    // Also verify that the ephemeron key was recorded in OLD_TO_NEW by the
++    // markers/write barrier.
++    Tagged<Object> k = *key_slot;
++    if (!HeapLayout::InYoungGeneration(host) &&
++        HeapLayout::InYoungGeneration(k)) {
++      MutablePageMetadata* page =
++          MutablePageMetadata::FromHeapObject(heap_->isolate(), host);
++      // No slots recorded on evacuation candidates.
++      CHECK_IMPLIES(!page->is_evacuation_candidate(),
++                    RememberedSet<OLD_TO_NEW_BACKGROUND>::Contains(
++                        page, key_slot.address()));
++      CHECK(!RememberedSet<OLD_TO_NEW>::Contains(page, key_slot.address()));
++    }
++  }
++
+  private:
+   V8_INLINE void VerifyHeapObjectImpl(Tagged<HeapObject> heap_object) {
+     if (!ShouldVerifyObject(heap_object)) return;
+@@ -265,10 +286,10 @@ class MainMarkingVisitor final
+  private:
+   // Functions required by MarkingVisitorBase.
+ 
+-  template <typename TSlot>
++  template <typename TSlot, RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
+   void RecordSlot(Tagged<HeapObject> object, TSlot slot,
+                   Tagged<HeapObject> target) {
+-    MarkCompactCollector::RecordSlot(object, slot, target);
++    MarkCompactCollector::RecordSlot<TSlot, kRecordYoung>(object, slot, target);
+   }
+ 
+   void RecordRelocSlot(Tagged<InstructionStream> host, RelocInfo* rinfo,
+@@ -411,6 +432,11 @@ void MarkCompactCollector::StartMarking(
+     heap()->Unmark();
+   }
+ 
++  // We can clear this remembered set once we start incremental marking. During
++  // incremental marking the markers will record ephemeron keys in OLD_TO_NEW
++  // instead.
++  heap_->ephemeron_remembered_set()->tables()->clear();
++
+ #ifdef V8_COMPRESS_POINTERS
+   heap_->young_external_pointer_space()->StartCompactingIfNeeded();
+   heap_->old_external_pointer_space()->StartCompactingIfNeeded();
+@@ -918,6 +944,10 @@ void MarkCompactCollector::Finish() {
+   // Shrink pages if possible after processing and filtering slots.
+   ShrinkPagesToObjectSizes(heap_, heap_->lo_space());
+ 
++  // Ensure that the GC and the incremental marking phase keep this remembered
++  // set empty.
++  DCHECK(heap_->ephemeron_remembered_set()->tables()->empty());
++
+ #ifdef DEBUG
+   DCHECK(state_ == SWEEP_SPACES || state_ == RELOCATE_OBJECTS);
+   state_ = IDLE;
+@@ -3818,15 +3848,6 @@ void MarkCompactCollector::ClearWeakCollections() {
+       }
+     }
+   }
+-  auto* table_map = heap_->ephemeron_remembered_set()->tables();
+-  for (auto it = table_map->begin(); it != table_map->end();) {
+-    if (MarkingHelper::IsUnmarkedAndNotAlwaysLive(
+-            heap_, non_atomic_marking_state_, it->first)) {
+-      it = table_map->erase(it);
+-    } else {
+-      ++it;
+-    }
+-  }
+ }
+ 
+ template <typename TObjectAndSlot, typename TMaybeSlot>
+@@ -5553,51 +5574,6 @@ void CollectRememberedSetUpdatingItems(
+ }
+ }  // namespace
+ 
+-class EphemeronTableUpdatingItem : public UpdatingItem {
+- public:
+-  enum EvacuationState { kRegular, kAborted };
+-
+-  explicit EphemeronTableUpdatingItem(Heap* heap) : heap_(heap) {}
+-  ~EphemeronTableUpdatingItem() override = default;
+-
+-  void Process() override {
+-    TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.gc"),
+-                 "EphemeronTableUpdatingItem::Process");
+-    PtrComprCageBase cage_base(heap_->isolate());
+-
+-    auto* table_map = heap_->ephemeron_remembered_set()->tables();
+-    for (auto it = table_map->begin(); it != table_map->end(); it++) {
+-      Tagged<EphemeronHashTable> table = it->first;
+-      auto& indices = it->second;
+-      if (Cast<HeapObject>(table)
+-              ->map_word(kRelaxedLoad)
+-              .IsForwardingAddress()) {
+-        // The object has moved, so ignore slots in dead memory here.
+-        continue;
+-      }
+-      DCHECK(IsMap(table->map(), cage_base));
+-      DCHECK(IsEphemeronHashTable(table, cage_base));
+-      for (auto iti = indices.begin(); iti != indices.end(); ++iti) {
+-        // EphemeronHashTable keys must be heap objects.
+-        ObjectSlot key_slot(table->RawFieldOfElementAt(
+-            EphemeronHashTable::EntryToIndex(InternalIndex(*iti))));
+-        Tagged<Object> key_object = key_slot.Relaxed_Load();
+-        Tagged<HeapObject> key;
+-        CHECK(key_object.GetHeapObject(&key));
+-        MapWord map_word = key->map_word(cage_base, kRelaxedLoad);
+-        if (map_word.IsForwardingAddress()) {
+-          key = map_word.ToForwardingAddress(key);
+-          key_slot.Relaxed_Store(key);
+-        }
+-      }
+-    }
+-    table_map->clear();
+-  }
+-
+- private:
+-  Heap* const heap_;
+-};
+-
+ void MarkCompactCollector::UpdatePointersAfterEvacuation() {
+   TRACE_GC(heap_->tracer(), GCTracer::Scope::MC_EVACUATE_UPDATE_POINTERS);
+ 
+@@ -5652,9 +5628,6 @@ void MarkCompactCollector::UpdatePointersAfterEvacuation() {
+     // empty after a full GC, such races can't happen.
+     DCHECK_IMPLIES(heap_->new_space(), heap_->new_space()->Size() == 0);
+ 
+-    updating_items.push_back(
+-        std::make_unique<EphemeronTableUpdatingItem>(heap_));
+-
+     auto pointers_updating_job = std::make_unique<PointersUpdatingJob>(
+         heap_->isolate(), this, std::move(updating_items));
+     TRACE_GC_NOTE_WITH_FLOW("PointersUpdatingJob started",
+diff --git a/src/heap/mark-compact.h b/src/heap/mark-compact.h
+index 3c24cf9c9e8..0d54ffc3308 100644
+--- a/src/heap/mark-compact.h
++++ b/src/heap/mark-compact.h
+@@ -135,11 +135,13 @@ class MarkCompactCollector final {
+ 
+   static void RecordRelocSlot(Tagged<InstructionStream> host, RelocInfo* rinfo,
+                               Tagged<HeapObject> target);
+-  template <typename THeapObjectSlot>
++  template <typename THeapObjectSlot,
++            RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
+   V8_INLINE static void RecordSlot(Tagged<HeapObject> object,
+                                    THeapObjectSlot slot,
+                                    Tagged<HeapObject> target);
+-  template <typename THeapObjectSlot>
++  template <typename THeapObjectSlot,
++            RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
+   V8_INLINE static void RecordSlot(MemoryChunk* source_chunk,
+                                    THeapObjectSlot slot,
+                                    Tagged<HeapObject> target);
+diff --git a/src/heap/marking-barrier-inl.h b/src/heap/marking-barrier-inl.h
+index 306e37e5d7e..e952d892cfa 100644
+--- a/src/heap/marking-barrier-inl.h
++++ b/src/heap/marking-barrier-inl.h
+@@ -18,7 +18,7 @@
+ namespace v8 {
+ namespace internal {
+ 
+-template <typename TSlot>
++template <typename TSlot, RecordYoungSlot kRecordYoung>
+ void MarkingBarrier::Write(Tagged<HeapObject> host, TSlot slot,
+                            Tagged<HeapObject> value) {
+   DCHECK(IsCurrentMarkingBarrier(host));
+@@ -27,8 +27,13 @@ void MarkingBarrier::Write(Tagged<HeapObject> host, TSlot slot,
+ 
+   MarkValue(host, value);
+ 
+-  if (slot.address() && IsCompacting(host)) {
+-    MarkCompactCollector::RecordSlot(host, slot, value);
++  // When recording slots to young pointers, we need to call RecordSlot even if
++  // IsCompacting() returns true. This is because IsCompacting() simply returns
++  // false when there are no evacuation candidates. New space pages are not
++  // considered evacuation candidates and may still be relocated.
++  if (slot.address() &&
++      (static_cast<bool>(kRecordYoung) || IsCompacting(host))) {
++    MarkCompactCollector::RecordSlot<TSlot, kRecordYoung>(host, slot, value);
+   }
+ }
+ 
+diff --git a/src/heap/marking-barrier.h b/src/heap/marking-barrier.h
+index 524d0374a8b..077e79a7fab 100644
+--- a/src/heap/marking-barrier.h
++++ b/src/heap/marking-barrier.h
+@@ -44,7 +44,7 @@ class MarkingBarrier {
+   static void DeactivateYoung(Heap* heap);
+   V8_EXPORT_PRIVATE static void PublishYoung(Heap* heap);
+ 
+-  template <typename TSlot>
++  template <typename TSlot, RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
+   void Write(Tagged<HeapObject> host, TSlot slot, Tagged<HeapObject> value);
+   void Write(Tagged<HeapObject> host, IndirectPointerSlot slot);
+   void Write(Tagged<InstructionStream> host, RelocInfo*,
+diff --git a/src/heap/marking-visitor-inl.h b/src/heap/marking-visitor-inl.h
+index c38e02da079..e3b8c080c22 100644
+--- a/src/heap/marking-visitor-inl.h
++++ b/src/heap/marking-visitor-inl.h
+@@ -649,7 +649,8 @@ size_t MarkingVisitorBase<ConcreteVisitor>::VisitEphemeronHashTable(
+     Tagged<HeapObject> key = Cast<HeapObject>(table->KeyAt(i, kRelaxedLoad));
+ 
+     SynchronizePageAccess(key);
+-    concrete_visitor()->RecordSlot(table, key_slot, key);
++    concrete_visitor()->template RecordSlot<ObjectSlot, RecordYoungSlot::kYes>(
++        table, key_slot, key);
+     concrete_visitor()->AddWeakReferenceForReferenceSummarizer(table, key);
+ 
+     ObjectSlot value_slot =
+diff --git a/src/heap/reference-summarizer.cc b/src/heap/reference-summarizer.cc
+index b9776952e04..a09bd5898b3 100644
+--- a/src/heap/reference-summarizer.cc
++++ b/src/heap/reference-summarizer.cc
+@@ -99,7 +99,7 @@ class ReferenceSummarizerMarkingVisitor
+                            0 /*code_flushing_increase*/),
+         marking_state_(marking_state) {}
+ 
+-  template <typename TSlot>
++  template <typename TSlot, RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
+   void RecordSlot(Tagged<HeapObject> object, TSlot slot,
+                   Tagged<HeapObject> target) {}
+ 
+diff --git a/src/heap/scavenger.cc b/src/heap/scavenger.cc
+index bd5a5265d9c..6aed99cf505 100644
+--- a/src/heap/scavenger.cc
++++ b/src/heap/scavenger.cc
+@@ -219,21 +219,14 @@ class IterateAndScavengePromotedObjectsVisitor final
+ 
+ namespace {
+ 
+-V8_INLINE bool IsUnscavengedHeapObject(Heap* heap, Tagged<Object> object) {
++V8_INLINE bool IsUnscavengedHeapObject(Tagged<Object> object) {
+   return Heap::InFromPage(object) && !Cast<HeapObject>(object)
+                                           ->map_word(kRelaxedLoad)
+                                           .IsForwardingAddress();
+ }
+ 
+-// Same as IsUnscavengedHeapObject() above but specialized for HeapObjects.
+-V8_INLINE bool IsUnscavengedHeapObject(Heap* heap,
+-                                       Tagged<HeapObject> heap_object) {
+-  return Heap::InFromPage(heap_object) &&
+-         !heap_object->map_word(kRelaxedLoad).IsForwardingAddress();
+-}
+-
+ bool IsUnscavengedHeapObjectSlot(Heap* heap, FullObjectSlot p) {
+-  return IsUnscavengedHeapObject(heap, *p);
++  return IsUnscavengedHeapObject(*p);
+ }
+ 
+ }  // namespace
+@@ -1236,17 +1229,24 @@ void ScavengerCollector::ProcessWeakReferences(
+ // entry has a dead new-space key.
+ void ScavengerCollector::ClearYoungEphemerons(
+     EphemeronRememberedSet::TableList* ephemeron_table_list) {
+-  ephemeron_table_list->Iterate([this](Tagged<EphemeronHashTable> table) {
++  ephemeron_table_list->Iterate([](Tagged<EphemeronHashTable> table) {
+     for (InternalIndex i : table->IterateEntries()) {
+       // Keys in EphemeronHashTables must be heap objects.
+       HeapObjectSlot key_slot(
+           table->RawFieldOfElementAt(EphemeronHashTable::EntryToIndex(i)));
+       Tagged<HeapObject> key = key_slot.ToHeapObject();
+-      if (IsUnscavengedHeapObject(heap_, key)) {
++      // If the key is not in the from page, it's not being scavenged.
++      if (!Heap::InFromPage(key)) continue;
++      DCHECK(!IsAnyHole(key));
++      MapWord map_word = key->map_word(kRelaxedLoad);
++      if (!map_word.IsForwardingAddress()) {
++        // If the key is not forwarded, then it's dead.
++        DCHECK(IsUnscavengedHeapObject(key));
+         table->RemoveEntry(i);
+       } else {
+-        Tagged<HeapObject> forwarded = ForwardingAddress(key);
+-        key_slot.StoreHeapObject(forwarded);
++        // Otherwise, we need to update the key slot to the forwarded address.
++        DCHECK(!IsUnscavengedHeapObject(key));
++        key_slot.StoreHeapObject(map_word.ToForwardingAddress(key));
+       }
+     }
+   });
+@@ -1265,13 +1265,28 @@ void ScavengerCollector::ClearOldEphemerons() {
+       HeapObjectSlot key_slot(table->RawFieldOfElementAt(
+           EphemeronHashTable::EntryToIndex(InternalIndex(*iti))));
+       Tagged<HeapObject> key = key_slot.ToHeapObject();
+-      if (IsUnscavengedHeapObject(heap_, key)) {
++      // If the key is not young, we don't need it in the remembered set.
++      if (!HeapLayout::InYoungGeneration(key)) {
++        iti = indices.erase(iti);
++      }
++      // If the key is not in the from page, it's not being scavenged.
++      if (!Heap::InFromPage(key)) continue;
++      DCHECK(!IsAnyHole(key));
++      MapWord map_word = key->map_word(kRelaxedLoad);
++      DCHECK_IMPLIES(Heap::InToPage(key), !map_word.IsForwardingAddress());
++      if (!map_word.IsForwardingAddress()) {
++        // If the key is not forwarded, then it's dead.
++        DCHECK(IsUnscavengedHeapObject(key));
+         table->RemoveEntry(InternalIndex(*iti));
+         iti = indices.erase(iti);
+       } else {
+-        Tagged<HeapObject> forwarded = ForwardingAddress(key);
++        // Otherwise, we need to update the key slot to the forwarded address.
++        DCHECK(!IsUnscavengedHeapObject(key));
++        Tagged<HeapObject> forwarded = map_word.ToForwardingAddress(key);
+         key_slot.StoreHeapObject(forwarded);
+         if (!HeapLayout::InYoungGeneration(forwarded)) {
++          // If the key was promoted out of new space, we don't need to keep it
++          // in the remembered set.
+           iti = indices.erase(iti);
+         } else {
+           ++iti;
+diff --git a/src/heap/mark-compact-inl.h b/src/heap/mark-compact-inl.h
+index 3e6a85377ec..9fa3424eb44 100644
+--- a/src/heap/mark-compact-inl.h
++++ b/src/heap/mark-compact-inl.h
+@@ -39,106 +39,55 @@ void MarkCompactCollector::MarkRootObject(
+ }
+ 
+ // static
+-template <typename THeapObjectSlot>
++template <typename THeapObjectSlot, RecordYoungSlot kRecordYoung>
+ void MarkCompactCollector::RecordSlot(Tagged<HeapObject> object,
+                                       THeapObjectSlot slot,
+                                       Tagged<HeapObject> target) {
+   MemoryChunk* source_page = MemoryChunk::FromHeapObject(object);
+   if (!source_page->ShouldSkipEvacuationSlotRecording()) {
+-    RecordSlot(source_page, slot, target);
++    RecordSlot<THeapObjectSlot, kRecordYoung>(source_page, slot, target);
+   }
+ }
+ 
+ // static
+-template <typename THeapObjectSlot>
++template <typename THeapObjectSlot, RecordYoungSlot kRecordYoung>
+ void MarkCompactCollector::RecordSlot(MemoryChunk* source_chunk,
+                                       THeapObjectSlot slot,
+                                       Tagged<HeapObject> target) {
+   MemoryChunk* target_chunk = MemoryChunk::FromHeapObject(target);
+-  if (target_chunk->IsEvacuationCandidate()) {
+-    MutablePageMetadata* source_page =
+-        MutablePageMetadata::cast(source_chunk->Metadata());
+-    if (target_chunk->IsFlagSet(MemoryChunk::IS_EXECUTABLE)) {
+-      // TODO(377724745): currently needed because flags are untrusted.
+-      SBXCHECK(!InsideSandbox(target_chunk->address()));
+-      RememberedSet<TRUSTED_TO_CODE>::Insert<AccessMode::ATOMIC>(
+-          source_page, source_chunk->Offset(slot.address()));
+-    } else if (source_chunk->IsFlagSet(MemoryChunk::IS_TRUSTED) &&
+-               target_chunk->IsFlagSet(MemoryChunk::IS_TRUSTED)) {
+-      // TODO(377724745): currently needed because flags are untrusted.
+-      SBXCHECK(!InsideSandbox(target_chunk->address()));
+-      RememberedSet<TRUSTED_TO_TRUSTED>::Insert<AccessMode::ATOMIC>(
+-          source_page, source_chunk->Offset(slot.address()));
+-    } else if (V8_LIKELY(!target_chunk->InWritableSharedSpace()) ||
+-               source_page->heap()->isolate()->is_shared_space_isolate()) {
+-      DCHECK_EQ(source_page->heap(), target_chunk->GetHeap());
+-      RememberedSet<OLD_TO_OLD>::Insert<AccessMode::ATOMIC>(
+-          source_page, source_chunk->Offset(slot.address()));
+-    } else {
+-      // DCHECK here that we only don't record in case of local->shared
+-      // references in a client GC.
+-      DCHECK(!source_page->heap()->isolate()->is_shared_space_isolate());
+-      DCHECK(target_chunk->GetHeap()->isolate()->is_shared_space_isolate());
+-      DCHECK(target_chunk->InWritableSharedSpace());
+-    }
+-  }
+-}
+-
+-// static
+-template <typename THeapObjectSlot, RecordYoungSlot kRecordYoung>
+-void MarkCompactCollector::RecordSlot(Tagged<HeapObject> host,
+-                                      THeapObjectSlot slot,
+-                                      Tagged<HeapObject> value) {
+-  MemoryChunk* host_chunk = MemoryChunk::FromHeapObject(host);
+-  if (host_chunk->ShouldSkipEvacuationSlotRecording()) {
+-    return;
+-  }
+-  RecordSlot<THeapObjectSlot, kRecordYoung>(host_chunk, slot, value);
+-}
+-
+-// static
+-template <typename THeapObjectSlot, RecordYoungSlot kRecordYoung>
+-void MarkCompactCollector::RecordSlot(MemoryChunk* host_chunk,
+-                                      THeapObjectSlot slot,
+-                                      Tagged<HeapObject> value) {
+-  const MemoryChunk* value_chunk = MemoryChunk::FromHeapObject(value);
+-  if (!value_chunk->IsEvacuationCandidate() &&
++  if (!target_chunk->IsEvacuationCandidate() &&
+       (!static_cast<bool>(kRecordYoung) ||
+-       !HeapLayout::InYoungGeneration(value_chunk, value))) {
++       !HeapLayout::InYoungGeneration(target))) {
+     return;
+   }
+-
+-  const auto* isolate = Isolate::Current();
+-  MutablePageMetadata* host_page =
+-      MutablePageMetadata::cast(host_chunk->Metadata(isolate));
+-  const MutablePageMetadata* value_page =
+-      MutablePageMetadata::cast(value_chunk->Metadata(isolate));
+-
++  MutablePageMetadata* source_page =
++      MutablePageMetadata::cast(source_chunk->Metadata());
+   if (static_cast<bool>(kRecordYoung) &&
+-      HeapLayout::InYoungGeneration(value_chunk, value)) {
++      HeapLayout::InYoungGeneration(target)) {
+     RememberedSet<OLD_TO_NEW_BACKGROUND>::Insert<AccessMode::ATOMIC>(
+-        host_page, host_chunk->Offset(slot.address()));
+-  } else if (value_page->is_executable()) {
+-    DCHECK(!InsideSandbox(value_chunk->address()));
++        source_page, source_chunk->Offset(slot.address()));
++  } else if (target_chunk->IsFlagSet(MemoryChunk::IS_EXECUTABLE)) {
++    // TODO(377724745): currently needed because flags are untrusted.
++    SBXCHECK(!InsideSandbox(target_chunk->address()));
+     RememberedSet<TRUSTED_TO_CODE>::Insert<AccessMode::ATOMIC>(
+-        host_page, host_chunk->Offset(slot.address()));
+-  } else if (host_page->is_trusted() && value_page->is_trusted()) {
+-    DCHECK(!InsideSandbox(value_chunk->address()));
++        source_page, source_chunk->Offset(slot.address()));
++  } else if (source_chunk->IsFlagSet(MemoryChunk::IS_TRUSTED) &&
++             target_chunk->IsFlagSet(MemoryChunk::IS_TRUSTED)) {
++    // TODO(377724745): currently needed because flags are untrusted.
++    SBXCHECK(!InsideSandbox(target_chunk->address()));
+     RememberedSet<TRUSTED_TO_TRUSTED>::Insert<AccessMode::ATOMIC>(
+-        host_page, host_chunk->Offset(slot.address()));
+-  } else if (V8_LIKELY(!value_page->is_writable_shared()) ||
+-             host_page->heap()->isolate()->is_shared_space_isolate()) {
+-    DCHECK_EQ(host_page->heap(), value_page->heap());
++        source_page, source_chunk->Offset(slot.address()));
++  } else if (V8_LIKELY(!target_chunk->InWritableSharedSpace()) ||
++             source_page->heap()->isolate()->is_shared_space_isolate()) {
++    DCHECK_EQ(source_page->heap(), target_chunk->GetHeap());
+     RememberedSet<OLD_TO_OLD>::Insert<AccessMode::ATOMIC>(
+-        host_page, host_chunk->Offset(slot.address()));
++        source_page, source_chunk->Offset(slot.address()));
+   } else {
+-    // The only case that we do not record are local->shared references from
+-    // client heaps, see the following DCHECKs.
+-    DCHECK(!host_page->heap()->isolate()->is_shared_space_isolate());
+-    DCHECK(value_page->heap()->isolate()->is_shared_space_isolate());
+-    DCHECK(value_page->is_writable_shared());
+-    DCHECK_EQ(value_page->is_writable_shared(),
+-              value_chunk->InWritableSharedSpace());
++    // DCHECK here that we only don't record in case of local->shared
++    // references in a client GC.
++    DCHECK(!source_page->heap()->isolate()->is_shared_space_isolate());
++    DCHECK(target_chunk->GetHeap()->isolate()->is_shared_space_isolate());
++    DCHECK(target_chunk->InWritableSharedSpace());
+   }
+ }
+ 

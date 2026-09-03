@@ -79,6 +79,7 @@ node %~dp0\node-script\patchs.js . %VERSION% %NEW_WRAP%
 if "%VERSION%"=="13.6.233.17" (
     echo =====[ patch d8 lowMemoryNotification ]=====
     node %~dp0\node-script\do-gitpatch.js -p %GITHUB_WORKSPACE%\patches\d8_low_memory_notification_v13.6.233.17.patch
+    node %~dp0\node-script\do-gitpatch.js -p %GITHUB_WORKSPACE%\patches\ephemeron_remembered_set_fix_v13.6.233.17.patch
 )
 
 echo =====[ Building V8 ]=====
