@@ -83,7 +83,8 @@ for f in *.o; do mv "$f" "${f%.o}_cxx.o"; done
 cd -
 
 WEE8_LIB=out.gn/$ARCH.release/obj/libwee8.a
-llvm-ar t "$WEE8_LIB" | sort > v8_members.txt
+llvm-ar t "$WEE8_LIB" > v8_members.txt || exit 1
+sort -o v8_members.txt v8_members.txt
 ls v8_custom_libcxx | sort > cxx_members.txt
 if [ -n "$(comm -12 v8_members.txt cxx_members.txt)" ]; then
   echo "error: libc++ objects would overwrite V8 objects with the same name in libwee8.a:"
