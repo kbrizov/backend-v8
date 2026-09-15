@@ -74,8 +74,16 @@ llvm-objcopy \
   --redefine-sym=_ZSt17rethrow_exceptionSt13exception_ptr=___ZSt17rethrow_exceptionSt13exception_ptr \
   --redefine-sym=_ZSt18uncaught_exceptionv=___ZSt18uncaught_exceptionv \
   --redefine-sym=_ZSt19uncaught_exceptionsv=___ZSt19uncaught_exceptionsv \
-  libv8_custom_libcxx.a 
-  
+  libv8_custom_libcxx.a
+
+STD_REDEFINES=""
+for s in $(llvm-nm --defined-only --extern-only libv8_custom_libcxx.a | awk 'NF==3{print $3}' | grep -E '^_Z(N?K?St[0-9]|St[0-9]|T[VIS]St[0-9]|T[VIS]NSt[0-9])' | grep -v '4__Cr' | sort -u); do
+  STD_REDEFINES="$STD_REDEFINES --redefine-sym=$s=__$s"
+done
+if [ -n "$STD_REDEFINES" ]; then
+  llvm-objcopy $STD_REDEFINES libv8_custom_libcxx.a
+fi
+
 mkdir v8_custom_libcxx
 cd v8_custom_libcxx
 llvm-ar x ../libv8_custom_libcxx.a
